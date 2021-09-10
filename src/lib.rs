@@ -7,6 +7,7 @@ use pyo3::create_exception;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pyo3::types::IntoPyDict;
+use pyo3::types::PyBytes;
 use pyo3::types::PyDict;
 use pyo3::wrap_pyfunction;
 
@@ -180,7 +181,14 @@ impl ToWrappedPyObject for norad::Font {
         let kwargs = [
             ("lib", self.lib.to_object(py)),
             ("layers", wrap_layerset(&self.layers, loader, py)),
-            ("info", self.font_info.to_wrapped_object(loader, py)),
+            (
+                "info",
+                self.font_info
+                    .as_ref()
+                    .map_or(PyDict::new(py).to_object(py), |v| {
+                        v.to_wrapped_object(loader, py)
+                    }),
+            ),
             (
                 "features",
                 self.features
@@ -201,7 +209,135 @@ impl ToWrappedPyObject for norad::Font {
     }
 }
 
-create_exception!(readwrite_ufo_glif, IondriveError, PyException);
+fn wrap_data(
+    object: &Py<PyAny>,
+    py: Python,
+    ufo: &norad::Font,
+    path: &PathBuf,
+) -> Result<(), PyErr> {
+    // For each path, do `Font.data[path] = content`.
+
+    let data_set = object.getattr(py, "data").map_err(|e| {
+        IondriveError::new_err(format!("Cannot get at Font.data: {}", e.to_string()))
+    })?;
+    for data_path in ufo.data_paths() {
+        // ufoLib conventions require the path to always have POSIX forward slashes as
+        // path separators.
+        let internal_path = data_path.strip_prefix("data").map_err(|e| {
+            IondriveError::new_err(format!(
+                "Failed to prepare data file path: {}",
+                e.to_string()
+            ))
+        })?;
+        let internal_path_posix = path_as_posix(&internal_path)?;
+
+        let full_path = path.join(data_path);
+        let contents = std::fs::read(&full_path).map_err(|e| {
+            IondriveError::new_err(format!(
+                "Failed to read file {}: {}",
+                &full_path.display(),
+                e.to_string()
+            ))
+        })?;
+
+        data_set
+            .as_ref(py)
+            .set_item(internal_path_posix, PyBytes::new(py, &contents))?;
+    }
+
+    // Signal to ufoLib2 code that norad loads data eagerly.
+    if data_set.as_ref(py).hasattr("_lazy")? {
+        data_set.as_ref(py).setattr("_lazy", false)?;
+    }
+
+    Ok(())
+}
+
+fn wrap_images(
+    object: &Py<PyAny>,
+    py: Python,
+    ufo: &norad::Font,
+    path: &PathBuf,
+) -> Result<(), PyErr> {
+    // For each path, do `Font.images[path] = content`.
+
+    let images_set = object.getattr(py, "images").map_err(|e| {
+        IondriveError::new_err(format!("Cannot get at Font.images: {}", e.to_string()))
+    })?;
+    for image_path in ufo.images_paths() {
+        // ufoLib conventions require the path to always have POSIX forward slashes as
+        // path separators.
+        let internal_path = image_path.strip_prefix("images").map_err(|e| {
+            IondriveError::new_err(format!(
+                "Failed to prepare images file path: {}",
+                e.to_string()
+            ))
+        })?;
+        let internal_path_posix = path_as_posix(&internal_path)?;
+
+        let full_path = path.join(image_path);
+        let contents = std::fs::read(&full_path).map_err(|e| {
+            IondriveError::new_err(format!(
+                "Failed to read file {}: {}",
+                &full_path.display(),
+                e.to_string()
+            ))
+        })?;
+
+        // Check for PNG header signature.
+        if &contents[..8] != &[137u8, 80, 78, 71, 13, 10, 26, 10] {
+            return Err(IondriveError::new_err(format!(
+                "Image at {} does not seem to be a PNG file",
+                image_path.display()
+            )));
+        }
+
+        images_set
+            .as_ref(py)
+            .set_item(internal_path_posix, PyBytes::new(py, &contents))?;
+    }
+
+    // Signal to ufoLib2 code that norad loads data eagerly.
+    if images_set.as_ref(py).hasattr("_lazy")? {
+        images_set.as_ref(py).setattr("_lazy", false)?;
+    }
+
+    Ok(())
+}
+
+/// Return path as a string with only forward slashes as path separators.
+///
+/// Error out if the path
+/// - cannot cleanly be converted to UTF-8, as the result is going to be
+///   used as a key in the images and data dictionaries Python-side.
+/// - does not appear to be relative or normalized, which is what we expect
+///   from norad.
+fn path_as_posix(path: &Path) -> PyResult<String> {
+    let parts = path
+        .components()
+        .map(|c| match c {
+            std::path::Component::Normal(n) => match n.to_str() {
+                Some(s) => Ok(s),
+                None => {
+                    return Err(IondriveError::new_err(format!(
+                        "Cannot cleanly represent path: {}",
+                        c.as_os_str().to_string_lossy()
+                    )))
+                }
+            },
+            _ => {
+                return Err(IondriveError::new_err(format!(
+                    "Expected relative, normalized path but got: {}",
+                    path.display()
+                )))
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(parts.join("/"))
+}
+
+create_exception!(iondrive, IondriveError, PyException);
 
 /// Load and return a UFO from `path`, using the objects from `font_objects_module`.
 ///
@@ -209,11 +345,30 @@ create_exception!(readwrite_ufo_glif, IondriveError, PyException);
 /// exported by ufoLib2, typically this will be the module `ufoLib2.objects`.
 #[pyfunction]
 #[pyo3(text_signature = "(font_objects_module, path, /)")]
-fn load(loader: &PyModule, path: PathBuf) -> PyResult<PyObject> {
+fn load(font_objects_module: &PyModule, path: PathBuf) -> PyResult<PyObject> {
     let gil = Python::acquire_gil();
     let py = gil.python();
-    match norad::Font::load(Path::new(&path)) {
-        Ok(ufo) => Ok(ufo.to_wrapped_object(loader, py)),
+    match norad::Font::load(&path) {
+        Ok(ufo) => {
+            let object = ufo.to_wrapped_object(font_objects_module, py);
+
+            // Signal to ufoLib2 code that norad loads data eagerly.
+            if object.as_ref(py).hasattr("_lazy")? {
+                object.as_ref(py).setattr("_lazy", false)?;
+            }
+
+            // ufoLib2 and defcon objects set the `_path` attribute when loading
+            // a UFO from disk, which fontmake relies on. Specifically set the
+            // private attribute here because ufoLib2 doesn't allow to setattr
+            // the public one.
+            object.as_ref(py).setattr("_path", &path)?;
+
+            // Wrap data and images separately until norad gains full support for them.
+            wrap_data(&object, py, &ufo, &path)?;
+            wrap_images(&object, py, &ufo, &path)?;
+
+            Ok(object)
+        }
         Err(error) => Err(IondriveError::new_err(error.to_string())),
     }
 }
